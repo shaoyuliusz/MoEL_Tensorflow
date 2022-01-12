@@ -4,7 +4,7 @@ import time
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
-from model.common_layer import EncoderLayer, DecoderLayer, MultiHeadAttention, Conv, PositionwiseFeed, _gen_bias_mask ,_gen_timing_signal, share_embedding, NoamOpt, _get_attn_subsequent_mask,  get_input_from_batch, get_output_from_batch, top_k_top_p_filtering
+from model.common_layer import EncoderLayer, DecoderLayer, MultiHeadAttention, Conv, PositionwiseFeedForward, _gen_bias_mask ,_gen_timing_signal, Embeddinglayer, _get_attn_subsequent_mask,  get_input_from_batch, get_output_from_batch, top_k_top_p_filtering
 from utils import config
 from utils.metric import rouge, moses_multi_bleu, _prec_recall_f1_score, compute_prf, compute_exact_match
 from copy import deepcopy
@@ -12,9 +12,42 @@ from sklearn.metrics import accuracy_score
 from tensorflow.keras import layers
 
 class Encoder(layers.Layer):
+    """
+    A Transformer Encoder module. 
+    Inputs should be in the shape [batch_size, length, hidden_size]
+    Outputs will have the shape [batch_size, length, hidden_size]
+    Refer Fig.1 in https://arxiv.org/pdf/1706.03762.pdf
+    
+    Universal means the idea of Universal Transformer is implemented, which is proposed to deal with the drawbacks of Transformer
+    in practice, i.e., Some problems that can be easily solved by RNN but not by the transformer, such as copying strings, or the
+    sequence length encountered during reasoning is longer than that during training (because it encounters position embedding
+    that it has not seen before), as well as the drawbacks in theory, i.e., Transformers are not computationally universal
+    (Turing Complete). So Universal Transformer added the loop, but not a loop of time, rather a cycle of depth
+    
+    Act can adjust the number of calculation steps. The universal transformer with act mechanism is called adaptive universal
+    transformer. It should be noted that the act of each position is independent. If a position A is stopped at time t, h_a(t)
+    will be copied until the last position stops. Of course, a maximum time will be set to avoid dead circulation.
+    """
     def __init__(self, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
     filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0, attention_dropout=0.0, 
     relu_dropout=0.0, use_mask=False, universal=False):
+        """
+        Parameters:
+            embedding_size: Size of embeddings
+            hidden_size: Hidden size
+            num_layers: Total layers in the Encoder
+            num_heads: Number of attention heads
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            max_length: Max sequence length (required for timing signal)
+            input_dropout: Dropout just after embedding
+            layer_dropout: Dropout for each layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+            use_mask: Set to True to turn on future value masking
+        """
 
         super(Encoder, self).__init__()
         self.universal = universal
@@ -51,7 +84,7 @@ class Encoder(layers.Layer):
     
     def __call__(self, inputs, mask, training=True): #ADHOC = TRUE
         #Add input dropout
-        
+        #The encoder layers will be stacked in sequence and the input x would go through each of them
         inputs = tf.cast(inputs, dtype = tf.float32) #inputs dim (32, 38)
         x = self.input_dropout(inputs)
         
@@ -69,16 +102,6 @@ class Encoder(layers.Layer):
                     x = self.enc(x, mask=mask, training=training)
                 y = self.layer_norm(x)
         else:
-            # Add timing signal
-#             MASK  Tensor("transformer_experts/Less_2:0", shape=(32, 38), dtype=bool)
-#             x (32, 100)
-#             inputs (32, 38)
-#             TIMING SIGNAL (1, 1000, 100)
-#             TIMING SIGNAL2 (1, 38, 100)
-            print('x', x.shape)
-            print('inputs', inputs.shape)
-            print('TIMING SIGNAL', self.timing_signal.shape)
-            print('TIMING SIGNAL2', self.timing_signal[:, :inputs.shape[1], :].shape)
             x += tf.cast(self.timing_signal[:, :inputs.shape[1], :], inputs.dtype)   
             for i in range(self.num_layers):
                 x = self.enc[i](x, mask, training=training)
@@ -86,9 +109,31 @@ class Encoder(layers.Layer):
         return y
 
 class Decoder(layers.Layer):
+    """
+    A Transformer Decoder module. 
+    Inputs should be in the shape [batch_size, length, hidden_size]
+    Outputs will have the shape [batch_size, length, hidden_size]
+    Refer Fig.1 in https://arxiv.org/pdf/1706.03762.pdf
+    """
     def __init__(self, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
                  filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0, 
                  attention_dropout=0.0, relu_dropout=0.0, universal=False):
+        """
+        Parameters:
+            embedding_size: Size of embeddings
+            hidden_size: Hidden size
+            num_layers: Total layers in the Encoder
+            num_heads: Number of attention heads
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            max_length: Max sequence length (required for timing signal)
+            input_dropout: Dropout just after embedding
+            layer_dropout: Dropout for each layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+        """
         super(Decoder, self).__init__()
         self.universal = universal
         self.num_layers = num_layers
@@ -147,9 +192,31 @@ class Decoder(layers.Layer):
         return y, attn_dist
 
 class MulDecoder(layers.Layer):
+    '''
+    The decoders that would be used in MoEL model, which consist of multiple parallel DecoderLayers including 1) a shared
+    listener that learns shared information for all emotions and n independently parameterized Transformer DecoderLayers 
+    2) and a sequence of stacked DecoderLayer which further transform the representation of the listeners and feed the
+    integrated representations towards a response Generator
+    '''
     def __init__(self, expert_num,  embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
                  filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0, 
                  attention_dropout=0.0, relu_dropout=0.0):
+        """
+        Parameters:
+            embedding_size: Size of embeddings
+            hidden_size: Hidden size
+            num_layers: Total layers in the Encoder
+            num_heads: Number of attention heads
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            max_length: Max sequence length (required for timing signal)
+            input_dropout: Dropout just after embedding
+            layer_dropout: Dropout for each layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+        """
         super(MulDecoder, self).__init__()
         self.num_layers = num_layers
         self.timing_signal = _gen_timing_signal(max_length, hidden_size)
@@ -213,7 +280,7 @@ class MulDecoder(layers.Layer):
         return y, attn_dist
 
 class Generator(layers.Layer):
-    "Define standard linear + softmax generation step."
+    "Define standard linear + softmax generation step. Get the representation from decoder and generate the probability distribution of tokens"
     def __init__(self, d_model, vocab):
         super(Generator, self).__init__()
         self.proj = layers.Dense(vocab)
@@ -235,12 +302,15 @@ class Generator(layers.Layer):
             enc_batch_extend_vocab_ = tf.concat([tf.expand_dims(enc_batch_extend_vocab, axis=1)]*x.shape[1], axis=1) ## extend for all seq
             if(beam_search):
                 enc_batch_extend_vocab_ = tf.concat([tf.expand_dims(enc_batch_extend_vocab_[0], axis=0)]*x.shape[0], axis=0) ## extend for all seq
-            logit = tf.math.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_))#scatter_add后面记得要手动实现一下，根据输入维度
+            logit = tf.math.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_))
             return logit
         else:
             return tf.nn.log_softmax(logit, axis = -1)
 
-class Transformer_experts(layers.Layer):
+class Transformer_experts(tf.keras.Model):
+    '''
+    The MoEL model that get Encoder and MulDecoder together, refer Fig.1 in https://arxiv.org/pdf/1908.07687.pdf
+    '''
     def __init__(self, vocab, decoder_number, model_file_path=None, is_eval=False, load_optim=False):
         super(Transformer_experts, self).__init__()
         self.vocab = vocab
@@ -265,18 +335,10 @@ class Transformer_experts(layers.Layer):
             # Share the weight matrix between target word embedding & the final logit dense layer
             self.generator.proj.weight = self.embedding.lut.weight
 
-        self.criterion = tf.keras.losses.CategoricalCrossentropy(from_logits=True, reduction='none')
-        if (config.label_smoothing):
-            self.criterion = tf.keras.losses.CategoricalCrossentropy(from_logits=True, reduction='none', label_smoothing=0.1)
-        
         if config.softmax:
             self.attention_activation =  layers.Softmax(axis = 1)
         else:
             self.attention_activation =  layers.Activation('sigmoid') #nn.Softmax()
-
-        self.optimizer = tf.keras.optimizers.Adam(lr=config.lr)
-        if(config.noam):
-            self.optimizer = NoamOpt(config.hidden_dim, 1, 8000, tf.keras.optimizers.Adam(lr=0, beta_1=0.9, beta_2=0.98, epsilon=1e-9))
 
         #if model_file_path is not None:
             #print("loading weights")
@@ -324,6 +386,9 @@ class Transformer_experts(layers.Layer):
         logit = self.generator(pre_logit, attn_dist, enc_batch_extend_vocab if config.pointer_gen else None, extra_zeros, attn_dist_db=None)
         return logit, logit_prob
     
+    '''
+    the greedy decoding method, which would generate the most likely token at each time
+    '''
     def decoder_greedy(self, batch, max_dec_step=30, training=False):
         enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
         mask_src = tf.expand_dims(tf.math.equal(enc_batch, config.PAD_idx), axis = 1)
@@ -373,6 +438,11 @@ class Transformer_experts(layers.Layer):
             sent.append(st)
         return sent
     
+    '''
+    the top-k strategy for decoding, where we select the top k most likely tokens, then sample a new token as the output from
+    the adjusted probability distribution
+    refer to https://arxiv.org/pdf/1805.04833.pdf for more details
+    '''
     def decoder_topk(self, batch, max_dec_step=30, training=False):
         enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
         mask_src = tf.expand_dims(tf.math.equal(enc_batch, config.PAD_idx), axis = 1)
@@ -405,6 +475,7 @@ class Transformer_experts(layers.Layer):
             else: 
                 out, attn_dist = self.decoder(self.embedding(ys),encoder_outputs, (mask_src,mask_trg), attention_parameters, training=training)
             logit = self.generator(out,attn_dist,enc_batch_extend_vocab, extra_zeros, attn_dist_db=None)
+            #The following two lines are the difference between greedy decoding method and top-k decoding method
             filtered_logit = top_k_top_p_filtering(logit[:, -1], top_k=3, top_p=0, filter_value=-float('Inf'))
             # Sample from the filtered distribution
             next_word = tf.squeeze(tf.random.categorical(tf.nn.softmax(filtered_logit, axis=-1), 1))
@@ -425,6 +496,10 @@ class Transformer_experts(layers.Layer):
             sent.append(st)
         return sent
 
+''' 
+CONVERTED FROM https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/research/universal_transformer_util.py#L1062, 
+which is the implementation ACT mechanism in Universal Transformer
+'''
 class ACT_basic(layers.Layer):
     def __init__(self,hidden_size):
         super(ACT_basic, self).__init__()
@@ -435,16 +510,16 @@ class ACT_basic(layers.Layer):
     def __call__(self, state, inputs, fn, time_enc, pos_enc, max_hop, encoder_output=None, decoding=False):
         # init_hdd
         ## [B, S]
-        halting_probability = tf.zeros(inputs.shape[0],inputs.shape[1])
+        halting_probability = tf.zeros((inputs.shape[0],inputs.shape[1]))
         ## [B, S
-        remainders = tf.zeros(inputs.shape[0],inputs.shape[1])
+        remainders = tf.zeros((inputs.shape[0],inputs.shape[1]))
         ## [B, S]
-        n_updates = tf.zeros(inputs.shape[0],inputs.shape[1])
+        n_updates = tf.zeros((inputs.shape[0],inputs.shape[1]))
         ## [B, S, HDD]
         previous_state = tf.zeros(inputs.shape)
         step = 0
         # for l in range(self.num_layers):
-        while( ((halting_probability<self.threshold) & (n_updates < max_hop)).byte().any()):
+        while tf.math.reduce_any(((halting_probability<self.threshold) & (n_updates < max_hop))):
             # Add Timing Signal
             state = state + tf.cast(time_enc[:, :inputs.shape[1], :], inputs.dtype)
             state = state + tf.cast(tf.tile(tf.expand_dims(pos_enc[:, step, :], 1), [1,inputs.shape[1],1]), inputs.dtype)
@@ -480,7 +555,7 @@ class ACT_basic(layers.Layer):
             if(decoding):
                 if(step==0): 
                     previous_att_weight = tf.zeros(attention_weight.shape)## [B, S, src_size]
-            previous_att_weight = ((attention_weight * tf.expand_dims(update_weights, axis=-1)) + (previous_att_weight * (1 - tf.expand_dims(update_weights, axis=-1))))
+                    previous_att_weight = ((attention_weight * tf.expand_dims(update_weights, axis=-1)) + (previous_att_weight * (1 - tf.expand_dims(update_weights, axis=-1))))
             ## previous_state is actually the new_state at end of hte loop 
             ## to save a line I assigned to previous_state so in the next 
             ## iteration is correct. Notice that indeed we return previous_state

@@ -8,22 +8,15 @@ from utils.metric import rouge, moses_multi_bleu, _prec_recall_f1_score, compute
 from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 
-
-if(config.model == 'trs'):
-    from utils.beam_omt import Translator
-#elif(config.model == 'seq2seq'):
-#    from utils.beam_ptr import Translator
-#elif(config.model == 'multi-trs'):
-#    from utils.beam_omt_multiplex import Translator
-elif(config.model == 'experts'):
-    from utils.beam_omt_experts import Translator
-
-
+'''
+Define the EncoderLayer Class for Transformer, which contains Layer Normalization Layer -> Multi-Head Attention Layer ->
+Dropout Layer -> Layer Normalization Layer -> Positionwise Feed Forward Layer -> Dropout Layer
+'''
 class EncoderLayer(layers.Layer):
     """
     Represents one Encoder layer of the Transformer Encoder
     Refer Fig. 1 in https://arxiv.org/pdf/1706.03762.pdf
-    NOTE: The layer normalization step has been moved to the input as per latest version of T2T
+    NOTE: The layer normalization step has been moved to the input as per latest version of Transformer
     """
     def __init__(self, hidden_size, total_key_depth, total_value_depth, filter_size, num_heads,
                  bias_mask=None, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0):
@@ -69,7 +62,12 @@ class EncoderLayer(layers.Layer):
         y = self.dropout(x + y, training=training)
         # y = self.layer_norm_end(y)
         return y
-    
+
+'''
+Define the DecoderLayer Class for Transformer, which contains Layer Normalization Layer -> Multi-Head Attention Layer ->
+Dropout Layer -> Layer Normalization Layer -> Multi-Head Encoder-Decoder Attention Layer -> Dropout Layer
+-> Layer Normalization Layer -> Positionwise Feed Forward Layer -> Dropout Layer
+'''
 class DecoderLayer(layers.Layer):
     """
     Represents one Decoder layer of the Transformer Decoder
@@ -137,6 +135,9 @@ class DecoderLayer(layers.Layer):
         # Return encoder outputs as well to work with tf.keras.models.Sequential
         return y, encoder_outputs, attention_weight, mask
 
+'''
+MultiExpertMultiHeadAttention is similar as MultiHeadAttention, while it can be used for multi-decoder, indicates weights sharing
+'''
 class MultiExpertMultiHeadAttention(layers.Layer):
     def __init__(self, num_experts, input_depth, total_key_depth, total_value_depth, output_depth, 
                  num_heads, bias_mask=None, dropout=0.0):
@@ -237,6 +238,10 @@ class MultiExpertMultiHeadAttention(layers.Layer):
         outputs = self.output_linear(contexts)
         return outputs
 
+'''
+The implementation of vanilla MultiHeadAttention, which refers to the implementation of vanilla Transformer in torch version, 
+see reference "The Annotated Transformer" at http://nlp.seas.harvard.edu/2018/04/03/attention.html
+'''
 class MultiHeadAttention(layers.Layer):
     """
     Multi-head attention as per https://arxiv.org/pdf/1706.03762.pdf
@@ -284,6 +289,7 @@ class MultiHeadAttention(layers.Layer):
         self.output_linear = layers.Dense(output_depth, use_bias=False)
         self.dropout = layers.Dropout(dropout)
     
+    #devide the input into mutiple heads
     def _split_heads(self, x):
         """
         Split x such to add an extra num_heads dimension
@@ -297,6 +303,7 @@ class MultiHeadAttention(layers.Layer):
         shape = x.shape
         return tf.transpose(tf.reshape(x, [shape[0], shape[1], self.num_heads, shape[2]//self.num_heads]), perm=[0, 2, 1, 3])
     
+    # merge the results after attention calculation, such that the transformer model can attend to different part of an input sequence
     def _merge_heads(self, x):
         """
         Merge the extra num_heads into the last dimension
@@ -345,6 +352,7 @@ class MultiHeadAttention(layers.Layer):
         outputs = self.output_linear(contexts)       
         return outputs, attetion_weights
 
+# 1d Cnovolution to improve the representation of input sequence
 class Conv(layers.Layer):
     """
     Convenience class that does padding and convolution for inputs in the format
@@ -370,6 +378,11 @@ class Conv(layers.Layer):
         outputs = layers.Conv1D(self.output_size, self.kernel_size, padding='valid')(tf.transpose(inputs, [0, 2, 1]), training=training)
         return outputs
 
+'''
+The implementation of PositionwiseFeedForward Layer, compared to the vanilla Transformer which contains only two Dense Layers
+are added, additional 1-d convolution can be implemented as well to improve the sequence representation and cross layer
+information sharing if the input layer_config contains the character 'c'
+'''
 class PositionwiseFeedForward(layers.Layer):
     """
     Does a Linear + RELU + Linear on each of the timesteps
@@ -426,6 +439,12 @@ def _gen_bias_mask(max_length):
     return tf.expand_dims(tf.expand_dims(tf_mask, 0), 1)
 
 def _gen_timing_signal(length, channels, min_timescale=1.0, max_timescale=1.0e4):
+    """
+    Generates a [1, length, channels] timing signal consisting of sinusoids
+    If Universal Transformer is used, time signal would be calculated in addition to position encoding
+    Adapted from:
+    https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/layers/common_attention.py
+    """
     position = np.arange(length)
     num_timescales = channels // 2
     log_timescale_increment = ( math.log(float(max_timescale) / float(min_timescale)) / (float(num_timescales) - 1))
@@ -467,7 +486,7 @@ class OutputLayer(layers.Layer):
 
 class SoftmaxOutputLayer(OutputLayer):
     """
-    Implements a softmax based output layer
+    Implements a softmax based output layer to transform the logits into probability distribution
     """
     def forward(self, hidden):
         logits = self.output_projection(hidden)
@@ -480,6 +499,11 @@ class SoftmaxOutputLayer(OutputLayer):
         log_probs = tf.nn.log_softmax(logits, axis=-1)
         return -tf.math.reduce_sum(tf.one_hot(labels, depth=self.output_size)*tf.nn.log_softmax(log_probs, -1))/len(labels)
 
+'''
+Since the self-attention implementation will destory the position information of input sequence, external position information
+should be added to indicates the position of each token, as position relationship is always crucial in Natural Language
+Processing tasks
+'''
 def position_encoding(sentence_size, embedding_dim):
     encoding = np.ones((embedding_dim, sentence_size), dtype=np.float32)
     ls = sentence_size + 1
@@ -554,6 +578,7 @@ def gen_embeddings(vocab):
 #     #embedding.lut.weight.data.requires_grad = True
 #     return embedding
 
+#Initialize the embedding of input tokens
 class Embeddinglayer(layers.Layer):
     def __init__(self, vocab_size, d_model):
         # model hyper parameter variables
@@ -566,38 +591,8 @@ class Embeddinglayer(layers.Layer):
         output = self.embedding(sequences) * tf.sqrt(tf.cast(self.d_model, dtype=tf.float32))
         return output
 
-class NoamOpt:
-    "Optim wrapper that implements rate."
-    def __init__(self, model_size, factor, warmup, optimizer):
-        self.optimizer = optimizer
-        self._step = 0
-        self.warmup = warmup
-        self.factor = factor
-        self.model_size = model_size
-        self._rate = 0
-    
-    def state_dict(self):
-        return self.optimizer.state_dict()
-
-    def step(self):
-        "Update parameters and rate"
-        self._step += 1
-        rate = self.rate()
-        for p in self.optimizer.param_groups:
-            p['lr'] = rate
-        self._rate = rate
-        self.optimizer.step()
-        
-    def rate(self, step = None):
-        "Implement `lrate` above"
-        if step is None:
-            step = self._step
-        return self.factor * \
-            (self.model_size ** (-0.5) *
-            min(step ** (-0.5), step * self.warmup ** (-1.5)))
-
 def get_attn_key_pad_mask(seq_k, seq_q):
-    ''' For masking out the padding part of key sequence. '''
+    ''' For masking out the padding part of key sequence such that they will not influence the gradient calculation. '''
 
     # Expand to fit the shape of key query attention matrix.
     len_q = seq_q.shape[1]
@@ -605,6 +600,10 @@ def get_attn_key_pad_mask(seq_k, seq_q):
     padding_mask = tf.broadcast_to(tf.expand_dims(padding_mask, 1), [-1, len_q, -1]) # b x lq x lk
     return padding_mask
 
+'''
+The input batch was stored in a tuple, this function was used to extract the input_batch index sequence, input_batch padding
+mask, input batch length, enc_batch_extend_vocab from the tuple
+'''
 def get_input_from_batch(batch):
     enc_batch = batch[0] #enc_batch = batch["input_batch"]
     enc_lens = batch[1] # enc_lens = batch["input_lengths"]
@@ -616,27 +615,22 @@ def get_input_from_batch(batch):
     extra_zeros = None
     enc_batch_extend_vocab = None
 
-    if config.pointer_gen:
-        enc_batch_extend_vocab = batch["input_ext_vocab_batch"]
-        # max_art_oovs is the max over all the article oov list in the batch
-        if batch["max_art_oovs"] > 0:
-            extra_zeros = tf.zeros((batch_size, batch["max_art_oovs"]))
-
     c_t_1 = tf.zeros((batch_size, 2 * config.hidden_dim))
 
     coverage = None
     if config.is_coverage:
         coverage = tf.zeros(enc_batch.shape)
 
-    return enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1
+    return enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1, coverage
 
+'''
+The input batch was stored in a tuple, this function was used to extract the target_batch index sequence, decoder batch padding
+mask, max decoding length from the tuple
+'''
 def get_output_from_batch(batch):
     #dec_batch = batch["target_batch"]
     dec_batch = batch[3]
-    if(config.pointer_gen):
-        target_batch = batch["target_ext_vocab_batch"]
-    else:
-        target_batch = dec_batch       
+    target_batch = dec_batch       
     #dec_lens_var = batch["target_lengths"]
     dec_lens_var = batch[4]
     #print('*******DEC BATCH*******', dec_lens_var) ----- Tensor("input_x_4:0", shape=(32, 1), dtype=int64)
@@ -647,6 +641,10 @@ def get_output_from_batch(batch):
     
     return dec_batch, dec_padding_mask, max_dec_len, dec_lens_var, target_batch
 
+'''
+Decoder can't see the future information. That is, for a sequence, at time step t, the decoding output should only depend on the
+output before t, not after t. Therefore, we need to find a way to hide the information after t.
+'''
 def sequence_mask(sequence_length, max_len=None):
     if max_len is None:
         max_len = tf.math.reduce_max(sequence_length)
@@ -654,13 +652,11 @@ def sequence_mask(sequence_length, max_len=None):
     seq_range = tf.range(0, max_len, dtype=tf.int32)
     seq_range_expand = tf.broadcast_to(tf.expand_dims(seq_range, 0), [batch_size, max_len])
     seq_range_expand = seq_range_expand
-    print('sequence_length', sequence_length.shape)
-    print('seq_range_expand ', seq_range_expand.shape)
     #seq_length_expand = tf.broadcast_to(tf.expand_dims(sequence_length, 1), seq_range_expand.shape)
     seq_length_expand = tf.broadcast_to(sequence_length, seq_range_expand.shape)
-    print('MASK ', seq_range_expand < seq_length_expand)
     return seq_range_expand < seq_length_expand
 
+# Update the config file
 def write_config():
     if(not config.test):
         if not os.path.exists(config.save_path):
@@ -683,79 +679,6 @@ def print_custum(emotion,dial,ref,hyp_g,hyp_b):
     print("Ref:{}".format(ref))
     print("----------------------------------------------------------------------")
     print("----------------------------------------------------------------------")
-
-def plot_ptr_stats(model):
-    stat_dict = model.generator.stats
-    a = np.mean(stat_dict["a"]) 
-    a_1_g = np.mean(stat_dict["a_1_g"]) 
-    a_1_g_1 = np.mean(stat_dict["a_1_g_1"]) 
-    a_STD = np.std(stat_dict["a"]) 
-    a_1_g_STD = np.std(stat_dict["a_1_g"]) 
-    a_1_g_1_STD = np.std(stat_dict["a_1_g_1"]) 
-    name = ['Vocab', 'Dialg', 'DB']
-    x_pos = np.arange(3)
-    CTEs = [a, a_1_g, a_1_g_1]
-    error = [a_STD, a_1_g_STD, a_1_g_1_STD]
-    fig, ax = plt.subplots()
-    ax.bar(x_pos, CTEs, yerr=error, align='center', alpha=0.5, ecolor='black', capsize=10)
-    ax.set_ylabel('Distribution weights')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(name)
-    ax.yaxis.grid(True)
-    # Save the figure and show
-    plt.tight_layout()
-    plt.savefig(config.save_path+'bar_plot_with_error_bars.png')
-
-def evaluate(model, data,  ty='valid', max_dec_step=30):
-    model.__id__logger = 0
-    dial = []
-    ref, hyp_g, hyp_b, hyp_t = [],[],[],[]
-    if ty=="test":
-        print("testing generation:")
-    t = Translator(model, model.vocab)
-    l = []
-    p = []
-    bce = []
-    acc = []
-    pbar = tqdm(enumerate(data),total=len(data))
-    for j, batch in pbar:
-        loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, 0, train=False)
-
-        l.append(loss)
-        p.append(ppl)
-        bce.append(bce_prog)
-        acc.append(acc_prog)
-        if(ty =="test"): 
-            sent_g = model.decoder_greedy(batch,max_dec_step=max_dec_step)
-            sent_b = t.beam_search(batch, max_dec_step=max_dec_step)
-            #sent_t = model.decoder_topk(batch, max_dec_step=max_dec_step)
-            for i, (greedy_sent, beam_sent)  in enumerate(zip(sent_g, sent_b)):
-                rf = " ".join(batch["target_txt"][i])
-                hyp_g.append(greedy_sent)
-                hyp_b.append(beam_sent) 
-                #hyp_t.append(topk_sent)
-                ref.append(rf)
-                print_custum(emotion= batch["program_txt"][i],
-                            dial=[" ".join(s) for s in batch['input_txt'][i]] if config.dataset=="empathetic" else " ".join(batch['input_txt'][i]),
-                            ref=rf,
-                            #hyp_t=topk_sent,
-                            hyp_g=greedy_sent,
-                            hyp_b=beam_sent)   
-        pbar.set_description("loss:{:.4f} ppl:{:.1f}".format(np.mean(l),math.exp(np.mean(l))))
-
-    loss = np.mean(l)
-    ppl = np.mean(p)
-    bce = np.mean(bce)
-    acc = np.mean(acc)
-    
-    bleu_score_g = moses_multi_bleu(np.array(hyp_g), np.array(ref), lowercase=True) 
-    bleu_score_b = moses_multi_bleu(np.array(hyp_b), np.array(ref), lowercase=True)
-    #bleu_score_t = moses_multi_bleu(np.array(hyp_t), np.array(ref), lowercase=True)
-
-    print("EVAL\tLoss\tPPL\tAccuracy\tBleu_g\tBleu_b")
-    print("{}\t{:.4f}\t{:.4f}\t{:.2f}\t{:.2f}\t{:.2f}".format(ty,loss,math.exp(loss), acc, bleu_score_g,bleu_score_b))
-    
-    return loss, math.exp(loss), bce, acc, bleu_score_g, bleu_score_b
 
 def count_parameters(model):
     return sum(np.prod(p.get_shape()) for p in model.trainable_weights)
@@ -792,15 +715,3 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0, filter_value=-float('Inf')):
         indices_to_remove = sorted_indices[sorted_indices_to_remove]
         logits[indices_to_remove] = filter_value
     return logits
-
-
-
-
-
-
-
-
-
-
-
-

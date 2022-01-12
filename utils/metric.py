@@ -1,4 +1,14 @@
-"""ROUGE metric implementation.
+"""
+<<<<<<< HEAD
+THIS CODE IS FROM THE ORIGINAL MoEL paper
+See https://github.com/HLTCHKUST/MoEL.
+It is not used in our implementation exercise.
+=======
+This code is adopted from the original code in MoEL paper
+ref: https://github.com/HLTCHKUST/MoEL/tree/master/utils
+Based on:
+>>>>>>> d985bf71f2a61c95c8a9ee08ae3996bea5e9229b
+ROUGE metric implementation.
 Copy from tf_seq2seq/seq2seq/metrics/rouge.py.
 This is a modified and slightly extended verison of
 https://github.com/miso-belica/sumy/blob/dev/sumy/evaluation/rouge.py.
