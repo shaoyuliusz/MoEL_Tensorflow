@@ -1,4 +1,3 @@
-# ECBM 4040 Final Project
 ## MoEL: Mixture of Empathetic Listeners
 <img src="plot/tf_logo_social.png" width="15%">
 
